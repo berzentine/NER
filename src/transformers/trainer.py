@@ -292,7 +292,12 @@ class Trainer:
         self.hp_name = None
         self.deepspeed = None
         self.is_in_train = False
-
+        self.overall_dep_score_train = {}
+        self.overall_dep_score_eval = {}
+        self.overall_dep_score_pred = {}
+        self.overall_pred_token_pred = {}
+        self.overall_pred_token_train = {}
+        self.overall_pred_token_eval = {}
         # memory metrics - must set up as early as possible
         self._memory_tracker = TrainerMemoryTracker(self.args.skip_memory_metrics)
         self._memory_tracker.start()
@@ -532,7 +537,7 @@ class Trainer:
             signature = inspect.signature(self.model.forward)
             self._signature_columns = list(signature.parameters.keys())
             # Labels may be named label or label_ids, the default data collator handles that.
-            self._signature_columns += ["label", "label_ids"]
+            self._signature_columns += ["label", "label_ids", "id"]
         columns = [k for k in self._signature_columns if k in dataset.column_names]
         ignored_columns = list(set(dataset.column_names) - set(self._signature_columns))
         if len(ignored_columns) > 0:
@@ -1289,7 +1294,6 @@ class Trainer:
 
             step = -1
             for step, inputs in enumerate(epoch_iterator):
-
                 # Skip past any already trained steps if resuming training
                 if steps_trained_in_current_epoch > 0:
                     steps_trained_in_current_epoch -= 1
@@ -1852,9 +1856,9 @@ class Trainer:
 
         if self.use_amp:
             with autocast():
-                loss = self.compute_loss(model, inputs)
+                loss = self.compute_loss(model, inputs, step_type="training")
         else:
-            loss = self.compute_loss(model, inputs)
+            loss = self.compute_loss(model, inputs, step_type="training")
 
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training
@@ -1876,7 +1880,7 @@ class Trainer:
 
         return loss.detach()
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, step_type=None):
         """
         How the loss is computed by Trainer. By default, all models return the loss in the first element.
 
@@ -1886,7 +1890,10 @@ class Trainer:
             labels = inputs.pop("labels")
         else:
             labels = None
+        sample_index = inputs.pop('id')
         outputs = model(**inputs)
+
+        # outputs['logits'] # batch x length x labels
         # Save past state if it exists
         # TODO: this needs to be fixed and made cleaner later.
         if self.args.past_index >= 0:
@@ -1897,6 +1904,45 @@ class Trainer:
         else:
             # We don't use .loss here since the model may return tuples instead of ModelOutput.
             loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+
+        # Compute dep score
+        probs = torch.nn.functional.softmax(outputs['logits'], dim=2)
+        for sample_idx in range(probs.shape[0]):
+            real_idx = sample_index[sample_idx].item()
+            for word_idx in range(probs.shape[1]):
+                gold_idx = inputs['labels'][sample_idx][word_idx].item()
+                if gold_idx == -100: continue
+                pred_tag = probs[sample_idx][word_idx].argmax().item()
+                prob_gold = probs[sample_idx, word_idx, gold_idx].item()
+                probs[sample_idx, word_idx, gold_idx] = -100
+                p_y_max = probs[sample_idx][word_idx].max().item()
+                aum_score = (prob_gold - p_y_max)
+                dep_score = (1 - aum_score) / 2
+                print(real_idx, word_idx, dep_score, step_type)
+
+                if step_type == "training":
+                    if real_idx not in self.overall_dep_score_train:
+                        self.overall_dep_score_train[real_idx] = {}
+                        self.overall_pred_token_train[real_idx] = {}
+                    if word_idx not in self.overall_dep_score_train[real_idx]:
+                        self.overall_dep_score_train[real_idx][word_idx] = []
+                        self.overall_pred_token_train[real_idx][word_idx] = 0
+                    self.overall_dep_score_train[real_idx][word_idx].append(dep_score)
+                    self.overall_pred_token_train[real_idx][word_idx] = pred_tag
+
+                elif step_type == "prediction":
+                    if real_idx not in self.overall_dep_score_pred:
+                        self.overall_dep_score_pred[real_idx] = {}
+                        self.overall_pred_token_pred[real_idx] = {}
+                    if word_idx not in self.overall_dep_score_pred[real_idx]:
+                        self.overall_dep_score_pred[real_idx][word_idx] = []
+                        self.overall_pred_token_pred[real_idx][word_idx] = 0
+                    self.overall_dep_score_pred[real_idx][word_idx].append(dep_score)
+                    self.overall_pred_token_pred[real_idx][word_idx] = pred_tag
+
+                elif step_type is None:
+                    print("need step type for dep compute in compute_loss function")
+                    raise
 
         return (loss, outputs) if return_outputs else loss
 
@@ -2493,9 +2539,9 @@ class Trainer:
                 if has_labels:
                     if self.use_amp:
                         with autocast():
-                            loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
+                            loss, outputs = self.compute_loss(model, inputs, return_outputs=True, step_type="prediction")
                     else:
-                        loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
+                        loss, outputs = self.compute_loss(model, inputs, return_outputs=True, step_type="prediction")
                     loss = loss.mean().detach()
                     if isinstance(outputs, dict):
                         logits = tuple(v for k, v in outputs.items() if k not in ignore_keys + ["loss"])

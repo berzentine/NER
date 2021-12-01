@@ -14,7 +14,13 @@
 
 python3 run_ner.py \
   --model_name_or_path bert-base-uncased \
+  --remove_unused_columns True \
+  --label_all_tokens True \
   --dataset_name conll2003 \
   --output_dir /tmp/test-ner \
+  --do_eval \
+  --max_train_samples 10 \
+  --max_eval_samples 10 \
   --do_train \
-  --do_eval
+  --overwrite_output_dir
+

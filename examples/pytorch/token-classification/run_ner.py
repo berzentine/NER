@@ -27,7 +27,7 @@ from typing import Optional
 
 import datasets
 import numpy as np
-from datasets import ClassLabel, load_dataset, load_metric
+from datasets import ClassLabel, load_dataset, load_metric, Value
 
 import transformers
 from transformers import (
@@ -407,8 +407,12 @@ def main():
         if "train" not in raw_datasets:
             raise ValueError("--do_train requires a train dataset")
         train_dataset = raw_datasets["train"]
+        new_features = train_dataset.features.copy()
+        new_features["id"] = Value('int64')
+        train_dataset = train_dataset.cast(new_features)
         if data_args.max_train_samples is not None:
             train_dataset = train_dataset.select(range(data_args.max_train_samples))
+            # TODO: Change this for local testing to a small number
         with training_args.main_process_first(desc="train dataset map pre-processing"):
             train_dataset = train_dataset.map(
                 tokenize_and_align_labels,
@@ -422,6 +426,9 @@ def main():
         if "validation" not in raw_datasets:
             raise ValueError("--do_eval requires a validation dataset")
         eval_dataset = raw_datasets["validation"]
+        new_features = eval_dataset.features.copy()
+        new_features["id"] = Value('int64')
+        eval_dataset = eval_dataset.cast(new_features)
         if data_args.max_eval_samples is not None:
             eval_dataset = eval_dataset.select(range(data_args.max_eval_samples))
         with training_args.main_process_first(desc="validation dataset map pre-processing"):
@@ -437,6 +444,9 @@ def main():
         if "test" not in raw_datasets:
             raise ValueError("--do_predict requires a test dataset")
         predict_dataset = raw_datasets["test"]
+        new_features = predict_dataset.features.copy()
+        new_features["id"] = Value('int64')
+        eval_dataset = predict_dataset.cast(new_features)
         if data_args.max_predict_samples is not None:
             predict_dataset = predict_dataset.select(range(data_args.max_predict_samples))
         with training_args.main_process_first(desc="prediction dataset map pre-processing"):
@@ -498,6 +508,7 @@ def main():
         compute_metrics=compute_metrics,
     )
 
+
     # Training
     if training_args.do_train:
         checkpoint = None
@@ -529,6 +540,30 @@ def main():
 
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
+
+
+    ###################################################
+                # Display DEP score
+    ###################################################
+    import pickle
+    # eval data
+    dep_data = trainer.overall_dep_score_pred
+    pred_data = trainer.overall_pred_token_pred
+    dep_arr, easy_threshold, hard_threshold = display_dep_score(dep_data, eval_dataset, label_list, pred_data, tokenizer)
+    eval_dump = {"data": dep_arr, "easy_th": easy_threshold, "hard_th": hard_threshold}
+    with open('eval.pickle', 'wb') as handle:
+        pickle.dump(eval_dump, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+    # train data
+    dep_data = trainer.overall_dep_score_train
+    pred_data = trainer.overall_pred_token_train
+    dep_arr, easy_threshold, hard_threshold = display_dep_score(dep_data, train_dataset, label_list, pred_data, tokenizer)
+    train_dump = {"data": dep_arr, "easy_th": easy_threshold, "hard_th": hard_threshold}
+    with open('train.pickle', 'wb') as handle:
+        pickle.dump(train_dump, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+    ###################################################
+
 
     # Predict
     if training_args.do_predict:
@@ -566,6 +601,29 @@ def main():
         trainer.push_to_hub(**kwargs)
     else:
         trainer.create_model_card(**kwargs)
+
+
+def display_dep_score(dep_data, dataset, label_list, pred_data, tokenizer):
+    dep_arr = {}
+    _temp = []
+    for sent_idx in dep_data:
+        sample_input_idx = dataset['input_ids'][sent_idx]
+        dep_arr[sent_idx] = {}
+        for word_idx, word_token in enumerate(sample_input_idx):
+            label_idx = dataset['labels'][sent_idx][word_idx]
+            if word_idx in dep_data and label_idx != -100:
+                # Dep, word, gold label, pred label
+                pred_label_idx = pred_data[sent_idx][word_idx]
+                dep_score = np.array(dep_data[sent_idx][word_idx]).mean()
+                dep_arr[sent_idx][word_idx] = (dep_score,
+                      tokenizer.decode(word_token), label_list[label_idx], label_list[pred_label_idx])
+                _temp.append(dep_score)
+                #print(dep_score,
+                #      tokenizer.decode(word_token), label_list[label_idx], label_list[pred_label_idx])
+        #print("========")
+    easy_threshold = np.array(_temp).mean()
+    hard_threshold = np.array(_temp).mean() +  np.array(_temp).std()
+    return dep_arr, easy_threshold, hard_threshold
 
 
 def _mp_fn(index):
